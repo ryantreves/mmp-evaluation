@@ -1,0 +1,405 @@
+---
+title: "Synthetic Control (multiparameter fitting)"
+author: "Ryan Treves"
+date: "2023-04-03"
+output: html_document
+---
+
+```{r setup, include=FALSE, message=F}
+knitr::opts_chunk$set(echo = TRUE, warning=F, message=F)
+# Setup
+library(tidyverse)
+library(Synth)
+library(yaml)
+library(lubridate)
+library(ggpubr)
+library(tidysynth)
+```
+
+```{r, warning=F}
+# Retrieve data paths
+ICIS_NPDES_data_path = read_yaml('config.yml', eval.expr=TRUE)$ICIS_NPDES_data_path
+# Specify visual parameters for figures
+preset_dpi <-  read_yaml('config.yml', eval.expr=TRUE)$figure_dpi
+```
+
+Load and clean data:
+```{r, message=F}
+# Load in nationwide data pre-2016 on mean exceedance pcts.
+
+# Source: exceedance_data.sql
+exceedance_data <- read_csv(paste(ICIS_NPDES_data_path,
+                                                    'exceedance_data_yearly_1000.csv',
+                                         sep='/'), 
+    col_types = cols(frac_any_exceedance = col_double(),
+                     frac_any_exceedance_20pct = col_double(),
+                     frac_any_exceedance_40pct = col_double(),
+                     avg_exceedance_rate = col_double(),
+                     avg_exceedance_20pct_rate = col_double(),
+                     avg_exceedance_40pct_rate = col_double(),
+                     mean_days_late = col_double())) %>%
+  replace_na(list(facility_type_indicator='All', parameter_category='All')) %>%
+  # Compute monitoring period with June 2008 as 0
+  mutate(monitoring_period=(lubridate::year(year)-2008)) %>%
+  filter(
+      # Remove Georgia due to a sharp increase in the number of permittees reporting
+       # to ICIS-NPDES in 2008
+    permit_state != 'GA',
+    
+      # Remove observations based on DMR data from fewer than 10 POTWs
+    n_permittees >= 10
+  )
+
+# Source: https://app.mode.com/editor/reglab/reports/aad9ee3f0964/queries/112eabdc96a0
+exceedance_data_yearly_5000 <- read_csv(paste(ICIS_NPDES_data_path,
+                                                    'exceedance_data_yearly_5000.csv',
+                                         sep='/'), 
+    col_types = cols(frac_any_exceedance = col_double(),
+                     frac_any_exceedance_20pct = col_double(),
+                     frac_any_exceedance_40pct = col_double(),
+                     avg_exceedance_rate = col_double(),
+                     avg_exceedance_20pct_rate = col_double(),
+                     avg_exceedance_40pct_rate = col_double())) %>%
+  replace_na(list(facility_type_indicator='All', parameter_category='All')) %>%
+  # Compute monitoring period with June 2008 as 0
+  mutate(monitoring_period=(lubridate::year(year)-2008)) %>%
+  filter(
+      # Remove Georgia due to a sharp increase in the number of permittees reporting
+       # to ICIS-NPDES in 2008
+    permit_state != 'GA',
+    
+      # Remove observations based on DMR data from fewer than 10 POTWs
+    n_permittees >= 10
+  )
+
+# Source: https://app.mode.com/editor/reglab/reports/aad9ee3f0964/queries/fcbc81ecdafd
+exceedance_data_semiannual_1000 <- read_csv(paste(ICIS_NPDES_data_path,
+                                                    'exceedance_data_semiannual_1000.csv',
+                                         sep='/'), 
+    col_types = cols(frac_any_exceedance = col_double(),
+                     frac_any_exceedance_20pct = col_double(),
+                     frac_any_exceedance_40pct = col_double(),
+                     avg_exceedance_rate = col_double(),
+                     avg_exceedance_20pct_rate = col_double(),
+                     avg_exceedance_40pct_rate = col_double())) %>%
+  replace_na(list(facility_type_indicator='All', parameter_category='All')) %>%
+  # Compute monitoring period with June 2008 as 0
+  mutate(monitoring_period=(lubridate::year(year)-2008.5)*2 + halfyear) %>%
+  filter(
+      # Remove Georgia due to a sharp increase in the number of permittees reporting
+       # to ICIS-NPDES in 2008
+    permit_state != 'GA',
+    
+      # Remove observations based on DMR data from fewer than 10 POTWs
+    n_permittees >= 10
+  )
+```
+
+Analysis and plotting function
+```{r}
+# This function takes in a dataframe of mean exceedance %s by year, state,
+# and optionally other variables (e.g., parametere category, facility type),
+# runs a synthetic control analysis, and returns the resulting plots.
+#' @param data Dataframe of mean exceedance %s.
+#' @param outcomes String or vector of strings listing the column names in 
+#'  `data` representing the outcomes to be used in the analysis. Analysis 
+#'  will be repeated for each outcome.
+#' @param treatment_period Integer representing the year of the intervention.
+#'  Default 2008.
+#' @param pretreatment_periods Integer representing the number of periods of data 
+#'  pre-intervention to use in training the synthetic control model. Default 8.
+#' @param posttreatment_periods Integer representing the number of periods post-
+#'  intervention over which to plot synthetic control predictions vs. treatment
+#'  unit outcomes. Default 16.
+#' @param predictors Vector of strings representing the names of additional
+#'  predictor variables to be used in the synthetic control model training. 
+#'  Default empty vector (only pre-intervention outcomes used in training model,
+#'  no additional covariates.) 
+#' 
+
+run_analysis <- function(data, outcomes=c('mean_exceedance_pct_a'),
+                         parameter='Ammonia',
+                                   treatment_period=0,
+                                   pretreatment_periods=4,
+                                   posttreatment_periods=8,
+                                   predictors=c('Ammonia', 'Pathogens',
+                                                'Solids', 'BOD'),
+                         trim_donor_pool=NULL,
+                         time='monitoring_period',
+                         margin_ipop=8e-4) {
+  
+  # Create list to collect plots
+  plots <- vector('list', 3*length(outcomes))
+  
+  # Filter out years not in analysis, remove states with missing data
+  data <- data %>%
+  filter((!!sym(time) >= treatment_period - pretreatment_periods) & 
+             (!!sym(time) <= treatment_period + posttreatment_periods)) %>%
+    drop_na(any_of(outcomes))
+  
+  for (i in seq(1, length(outcomes))) {
+    
+    # Select only states with values of our outcome variable of interest, and 
+    # parameterwise outcomes (to be used as covariates) for all
+    # pretreatment and posttreatment periods
+    outcome_data <- data %>%
+           filter(parameter_category %in% c(predictors, parameter)) %>%
+           group_by(permit_state, parameter_category) %>%
+           mutate(timepoints=sum(!is.na(!!sym(eval(outcomes[i]))))) %>%
+           filter(timepoints == pretreatment_periods+posttreatment_periods+1) %>%
+           group_by(permit_state) %>%
+           mutate(n_qualifying_params=n_distinct(parameter_category)) %>%
+           filter(n_qualifying_params==length(predictors)) %>%
+           select(permit_state, parameter_category, !!sym(eval(outcomes[i])), !!sym(time)) %>%
+           ungroup()
+    
+    # Prep data
+    # Optional: Trim donor pool states to states with low MSE with CA pretreatment predictors
+    if (!is.null(trim_donor_pool)) {
+      CA_pretreatment <- outcome_data %>% filter(!!sym(time) < 0,
+                                         permit_state=='CA',
+                                         parameter_category %in% predictors) %>%
+        mutate(CA_outcome=!!sym(eval(outcomes[i]))) %>%
+        select(!!sym(time), parameter_category, CA_outcome)
+      donor_pool_states <- outcome_data %>%
+        filter(!!sym(time) < 0,permit_state != 'CA', parameter_category %in% predictors) %>%
+        select(permit_state, !!sym(time), parameter_category, !!sym(eval(outcomes[i]))) %>%
+        inner_join(CA_pretreatment, by=c(time, 'parameter_category')) %>%
+        mutate(sq_err=(!!sym(eval(outcomes[i]))-CA_outcome)^2) %>%
+        group_by(permit_state) %>%
+        summarize(mse=mean(sq_err)) %>%
+        filter(mse <= quantile(mse, trim_donor_pool)) %>%
+        select(permit_state)
+      
+    outcome_data <- outcome_data %>% filter(permit_state %in% c(donor_pool_states$permit_state, 'CA'))
+    }
+    
+    # Pivot variables for analysis
+    outcome_data <- outcome_data %>% pivot_wider(names_from='parameter_category',
+                                 values_from=outcomes[i])
+
+    synth_fit <- outcome_data %>%
+      synthetic_control(outcome=!!sym(parameter),
+                      unit=permit_state,
+                      time=!!sym(time),
+                      i_unit = 'CA',
+                      i_time = treatment_period,
+                      generate_placebos=T)
+    
+    # Create predictors
+    for (j in seq(1:pretreatment_periods)) {
+      for (predictor in predictors) {
+              synth_fit <- synth_fit %>%
+    generate_predictor(time_window=
+                         treatment_period-pretreatment_periods+j-1, !!sym(paste(as.character(treatment_period-pretreatment_periods+j-1), predictor, sep='_')):=mean(!!sym(predictor)))
+      }
+    }
+    
+    # Fit and run model
+    synth_fit <- synth_fit %>% generate_weights(optimization_window = (treatment_period-pretreatment_periods):(treatment_period-1),
+                     custom_variable_weights = rep(1, pretreatment_periods*length(predictors))/pretreatment_periods*length(predictors),
+                     margin_ipop = margin_ipop) %>%
+    generate_control()
+  
+    # Collect plots
+    placebo_plot <- synth_fit %>% plot_placebos()+xlab('')+ylab('')+ggtitle('')+
+      scale_x_continuous(breaks=c(-4, -2, 0, 2, 4, 6, 8),
+                                                labels = seq(2004, 2016, by=2))
+    # Remove unneeded labels
+    placebo_plot$labels <- placebo_plot$labels[-c(1, 2, 3, 7, 9, 10)]
+    plots[[i]] <- placebo_plot
+    
+    counterfactual_plot <- synth_fit %>% plot_trends()+xlab('')+ylab('')+ggtitle('')+
+      scale_x_continuous(breaks=c(-4, -2, 0, 2, 4, 6, 8),
+                                                labels = seq(2004, 2016, by=2))
+    # Remove unneeded labels
+    counterfactual_plot$labels <- counterfactual_plot$labels[-c(1, 2, 3, 6, 7)]
+    # Change lines to solid
+    counterfactual_plot$mapping$linetype[[2]] <- 'solid'
+    # Remove points, leaving only lines
+    counterfactual_plot$layers <- counterfactual_plot$layers[-3]
+    
+    plots[[length(outcomes) + i]] <- counterfactual_plot
+    plots[[2*length(outcomes) + i]] <- synth_fit %>% plot_weights()
+    # Store the fisher's exact test p-value for an effect
+    plots[[3*length(outcomes) + i]] <- (synth_fit %>% grab_signficance() %>% filter(unit_name=='CA'))$fishers_exact_pvalue
+  }
+  
+  return(plots)
+}
+```
+
+Run analysis and plot results
+
+Note: for some specifications, the optimization step throws a 
+singularity error. In these cases, the `margin_ipop` must be 
+increased.
+
+```{r}
+# Parameterwise results
+POTW_2008_ammonia <- run_analysis(exceedance_data,
+                      parameter='Ammonia', margin_ipop=3e-3)
+POTW_2008_pathogens <- run_analysis(exceedance_data,
+                      parameter='Pathogens',
+                      margin_ipop = 3e-3)
+POTW_2008_BOD <- run_analysis(exceedance_data,
+                      parameter='BOD',
+                      margin_ipop = 2e-3)
+POTW_2008_solids <- run_analysis(exceedance_data,
+                      parameter='Solids')
+```
+
+What about looking at alternative outcome measures?
+```{r}
+# Outcome robustness checks
+outcome_robustness_plot_list <- list()
+for (param in c('Ammonia', 'Pathogens', 'BOD', 'Solids')) {
+  plots <- run_analysis(exceedance_data,
+                       parameter=param,
+                      outcomes=c('mean_exceedance_pct_a_maxmin',
+                                 'frac_any_exceedance',
+                  'frac_any_exceedance_20pct',
+                  'frac_any_exceedance_40pct'
+                  ),
+                      margin_ipop=1e-3)
+  outcome_robustness_plot_list <- c(outcome_robustness_plot_list, plots)
+}
+```
+
+What effect did the 2008 enforcement push have on late reporting?
+```{r}
+late_reports_fit <- run_analysis(exceedance_data, outcomes = c('mean_days_late'),
+                                 predictors = c('All'), parameter='All', margin_ipop = 2e-3)
+late_reports_fit[[1]]+labs(y='Gap in mean number of days late')+
+  theme(legend.position = 'None', axis.title.y=element_text(size=10))
+ggsave('fig_late_reporting_result.png', dpi=preset_dpi, width=2100, height=1400,
+       units='px', bg='white')
+late_reports_fit[[2]]$data <- late_reports_fit[[2]]$data %>% filter(name != 'Synthetic')
+late_reports_fit[[2]]+labs(y='Mean number of days late')+theme(legend.position = 'None')
+ggsave('fig_late_reporting_timeseries.png', dpi=preset_dpi, width=2100, height=1400,
+       units='px', bg='white')
+```
+
+```{r}
+# Looking at p-values
+
+# View(synth_fit %>% grab_synthetic_control(placebo=T) %>%
+#   mutate(pre_post=ifelse(time_unit<=0, 'pre', 'post')) %>%
+#   group_by(pre_post, .id, .placebo) %>%
+#   summarize(mspe = sum((real_y - synth_y)^2)/dplyr::n(),.groups='drop', mspe_negative=mean(ifelse(real_y<synth_y, (real_y-synth_y)^2, 0))) %>%
+#   pivot_wider(names_from=c('pre_post'), values_from = c('mspe', 'mspe_negative')) %>%
+#   mutate(r=mspe_negative_post/mspe_pre, r_reg=mspe_post/mspe_pre) %>%
+#   filter(mspe_pre<6.206) %>%
+#   arrange(desc(r)))
+# 
+# synth_fit %>% grab_signficance() %>% filter(pre_mspe<6.206)
+```
+
+Creating more useful figures
+
+```{r}
+# Main figure
+ggarrange(POTW_2008_pathogens[[1]]+labs(title='Pathogens')+ylim(-35, 35),
+          POTW_2008_ammonia[[1]]+labs(title='Ammonia')+ylim(-35, 35), POTW_2008_BOD[[1]]+labs(title='BOD')+ylim(-35, 35),
+          POTW_2008_solids[[1]]+labs(title='Solids')+ylim(-35, 35),
+          nrow=2, ncol=2, common.legend=T,
+          hjust=c(-0.4, -1, -0.6),
+         vjust=0.8, font.label=list(size=10, face='plain'),
+         legend='none') %>%
+          annotate_figure(left=text_grob('Gap in mean exceedance %', rot=90))
+
+ggsave('fig_parameter_robustness.png', dpi=preset_dpi, width=4200, height=2800, units='px', bg='white')
+```
+```{r}
+# Main figure counterfactual
+ggarrange(POTW_2008_pathogens[[2]]+labs(title='Pathogens')+theme(plot.title = element_text(size=10)),
+          POTW_2008_ammonia[[2]]+labs(title='Ammonia')+theme(plot.title = element_text(size=10)), POTW_2008_BOD[[2]]+labs(title='BOD')+theme(plot.title = element_text(size=10)),
+          POTW_2008_solids[[2]]+labs(title='Solids')+theme(plot.title = element_text(size=10)),
+          nrow=2, ncol=2, common.legend=T,
+          hjust=c(-0.4, -1, -0.6),
+         vjust=0.8, font.label=list(size=10, face='plain')) %>%
+          annotate_figure(top=text_grob('Mean exceedance % A (All base codes)', face='bold'))
+ggsave('fig_main_cf.png', width=6, height=4, units='in', dpi=preset_dpi, bg='white')
+```
+
+```{r}
+POTW_2008_solids[[3]]$data %>%
+       filter(type=='Control Unit Weights (W)') %>%
+       arrange(desc(weight)) %>%
+       head()
+```
+
+```{r}
+ggarrange(outcome_robustness_plot_list[[1]]+ylim(-50, 50)+labs(title='Max/Min base codes',
+                                                               y='Ammonia')+theme(axis.text.x = element_blank(),
+                                                                                  plot.title = element_text(size=10)),
+          outcome_robustness_plot_list[[2]]+labs(title='Fraction of DMRs with \n an exceedance')+ylim(-0.2, 0.2)+theme(axis.text.x = element_blank(),
+                                                                                  plot.title = element_text(size=10)),
+          outcome_robustness_plot_list[[3]]+labs(title='Fraction of DMRs with \n an exceedance > 20%')+ylim(-0.2, 0.2)+theme(axis.text.x = element_blank(),
+                                                                                  plot.title = element_text(size=10)),
+          outcome_robustness_plot_list[[4]]+labs(title='Fraction of DMRs with \n an exceedance > 40%')+ylim(-0.2, 0.2)+theme(axis.text.x = element_blank(),
+                                                                                  plot.title = element_text(size=10)),
+          outcome_robustness_plot_list[[17]]+ylim(-50, 50)+labs(y='Pathogens')+theme(axis.text.x = element_blank()),
+          outcome_robustness_plot_list[[18]]+ylim(-0.2, 0.2)+theme(axis.text.x = element_blank()),
+          outcome_robustness_plot_list[[19]]+ylim(-0.2, 0.2)+theme(axis.text.x = element_blank()),
+          outcome_robustness_plot_list[[20]]+ylim(-0.2, 0.2)+theme(axis.text.x = element_blank()),
+          outcome_robustness_plot_list[[33]]+ylim(-50, 50)+labs(y='BOD')+theme(axis.text.x = element_blank()),
+          outcome_robustness_plot_list[[34]]+ylim(-0.2, 0.2)+theme(axis.text.x = element_blank()),
+          outcome_robustness_plot_list[[35]]+ylim(-0.2, 0.2)+theme(axis.text.x = element_blank()),
+          outcome_robustness_plot_list[[36]]+ylim(-0.2, 0.2)+theme(axis.text.x = element_blank()),
+          outcome_robustness_plot_list[[49]]+ylim(-50, 50)+labs(y='Solids'),
+          outcome_robustness_plot_list[[50]]+ylim(-0.2, 0.2),
+          outcome_robustness_plot_list[[51]]+ylim(-0.2, 0.2),
+          outcome_robustness_plot_list[[52]]+ylim(-0.2, 0.2),
+          nrow=4, ncol=4, common.legend=T,
+          hjust=c(-0.4, -1, -0.6),
+         vjust=0.8, font.label=list(size=10, face='plain'),
+         legend='none')
+ggsave('fig_outcome_robustness.png', width=10, height=7, units='in', dpi=preset_dpi, bg='white')
+```
+Run all of our specifications and create a table
+
+```{r}
+all_p_values <- tibble(.rows=8)
+for (parameter in c('Ammonia', 'BOD', 'Solids', 'Pathogens')) {
+  # Covariates, semiannual
+  p1 <- run_analysis(exceedance_data_semiannual_1000,
+                        parameter=parameter, pretreatment_periods=8, posttreatment_periods = 16,
+                      margin_ipop = 3e-3)[[4]]
+  # No covariates, semiannual
+  p2 <- run_analysis(exceedance_data_semiannual_1000,
+                        parameter=parameter, pretreatment_periods=8, posttreatment_periods = 16,
+               predictors=parameter, margin_ipop = 3e-3)[[4]]
+  # 5000% exceedance cutoff
+  p3 <- run_analysis(exceedance_data_yearly_5000,
+                        parameter=parameter, margin_ipop = 3e-3)[[4]]
+  # Mean exceedance B
+  p4 <- run_analysis(exceedance_data_yearly_1000, margin_ipop = 3e-3, 
+                        parameter=parameter, outcomes = c('mean_exceedance_pct_b'))[[4]]
+  # Mean exceedance A, max/min only
+  p5 <- run_analysis(exceedance_data_yearly_1000,
+                        parameter=parameter, outcomes = c('mean_exceedance_pct_a_maxmin'), margin_ipop = 3e-3)[[4]]
+  # any_exceedance
+  p6 <- run_analysis(exceedance_data_yearly_1000,
+                        parameter=parameter, outcomes = c('frac_any_exceedance'), margin_ipop = 3e-3)[[4]]
+  # Any_exceedance > 20%
+  p7 <- run_analysis(exceedance_data_yearly_1000,
+                        parameter=parameter, outcomes = c('frac_any_exceedance_20pct'), margin_ipop = 3e-3)[[4]]
+  # Trim donor pool
+  p8 <- run_analysis(exceedance_data_yearly_1000,
+                        parameter=parameter, trim_donor_pool = 0.9, margin_ipop = 3e-3)[[4]]
+  
+  # Collect and store p-values
+  p_values <- c(p1, p2, p3, p4, p5, p6, p7, p8)
+  all_p_values <- all_p_values %>% mutate(!!sym(parameter):=p_values)
+}
+
+# Aggregating over all parameters
+all_param_p <- run_analysis(exceedance_data_yearly_1000, parameter='All',
+                            predictors=c('Ammonia', 'Pathogens',
+                                                'Solids', 'BOD', 'All'), margin_ipop = 3e-3)[[4]]
+
+all_p_values <- round(all_p_values, 2)
+```
+
+

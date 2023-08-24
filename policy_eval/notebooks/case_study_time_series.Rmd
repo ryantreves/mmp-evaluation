@@ -1,0 +1,124 @@
+---
+title: "Case study time series"
+author: "Ryan Treves"
+date: "2023-02-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=F, message=F)
+
+library(tidyverse)
+library(DMRfraud)
+library(ggpubr)
+library(lubridate)
+library(yaml)
+library(readxl)
+```
+
+```{r}
+# Load data
+# Retrieve data paths
+ICIS_NPDES_data_path = read_yaml('config.yml', eval.expr=TRUE)$ICIS_NPDES_data_path
+CIWQS_data_path <- read_yaml('config.yml', eval.expr=T)$CIWQS_data_path
+# Specify visual parameters for figures
+preset_dpi <-  read_yaml('config.yml', eval.expr=TRUE)$figure_dpi
+
+case_study_data <- read_csv(paste0(ICIS_NPDES_data_path, '/case_study_data.csv'))
+violations <- read_excel(paste0(CIWQS_data_path, '/violations_export_2021-10-26.xlsx')) %>%
+  mutate(FACILITY_ID=as.character(FACILITY_ID),
+         `VIOLATION ID (VID)`=as.character(`VIOLATION ID (VID)`)) %>%
+  # We only want POTWs and effluent violations
+  filter(`PLACE SUBTYPE`=='Wastewater Treatment Facility',
+          `VIOLATION TYPE`=='Effluent',
+         `STATUS...79` != 'Dismissed',
+         (!str_detect(`VIOLATION COMMENTS`, 'In compliance') | 
+            is.na(`VIOLATION COMMENTS`)),
+         (!str_detect(`CORRECTIVE ACTION`, 'In compliance') | 
+            is.na(`CORRECTIVE ACTION`))) %>%
+  # Select only useful columns
+  select(`VIOLATED FACILITY REGION`, FACILITY_ID, `FACILITY NAME`, `PLACE SUBTYPE`,
+         `FACILITY TYPE`, `DESIGN FLOW`, `NPDES# CA#`, `VIOLATION ID (VID)`,
+         `VIOLATION DESCRIPTION`, `VIOLATION COMMENTS`, `CORRECTIVE ACTION`,
+         `OCCURRED ON`)
+
+# Enforcement data
+enforcements <- read_csv(paste0(CIWQS_data_path, '/enf_actions_export.csv'),
+                         col_types = cols(`FACILITY ID` = col_character(), 
+        `ENFORCEMENT ID (EID)` = col_character()))
+
+# penalty projects
+pps <- read_csv(paste0(CIWQS_data_path, '/Penalty_Project_Report.csv')) %>% 
+  filter(`Addresses MMP?`=='Y', `Project Type`=='CP') %>% 
+  rename(`FACILITY NAME`=Facility) %>%
+  select(`FACILITY NAME`) %>%
+  inner_join(violations, by='FACILITY NAME')
+```
+
+```{r}
+# Data cleaning
+enforcements <- enforcements %>%
+  # We want MMP-related enforcement actions on POTWs with penalties
+  filter(`TOTAL MMP VIOLATIONS #`>0,
+         (`LIABILITY $ AMOUNT`>0 | `TOTAL ASSESSMENT AMOUNT`>0),
+         `PLACE SUBTYPE`=='Wastewater Treatment Facility',
+         `STATUS...82` != 'Draft') %>%
+  select(`REGION...1`, `FACILITY ID`, `FACILITY NAME`,
+         `ENFORCEMENT ID (EID)`, `ORDER / RESOLUTION NUMBER`,
+         `ENFORCEMENT ACTION TYPE`, `EFFECTIVE DATE...76`, `ADOPTION / ISSUANCE DATE`,
+         `ACL ISSUANCE DATE`, `EPL ISSUANCE DATE`, `STATUS...82`, `DESCRIPTION`,
+         `TOTAL ASSESSMENT AMOUNT`, `INITIAL ASSESSED AMOUNT`, `LIABILITY $ AMOUNT`,
+         `LIABILITY $ PAID`, `TOTAL $ PAID/COMPLETED AMOUNT`) %>%
+  rename(`EFFECTIVE DATE`=`EFFECTIVE DATE...76`,
+         `REGION`=`REGION...1`,
+         FACILITY_ID=`FACILITY ID`,
+         `STATUS`=`STATUS...82`) %>%
+  mutate(`EFFECTIVE DATE`=mdy(`EFFECTIVE DATE`),
+         `ADOPTION / ISSUANCE DATE`=mdy(`ADOPTION / ISSUANCE DATE`),
+         `ACL ISSUANCE DATE`=mdy(`ACL ISSUANCE DATE`),
+         `EPL ISSUANCE DATE`=mdy(`EPL ISSUANCE DATE`)) %>% 
+  # Estimate the date of an enforcement action
+  rowwise() %>%
+  mutate(min_issuance_date=min(`ACL ISSUANCE DATE`, `EPL ISSUANCE DATE`, na.rm=T)) %>%
+  mutate(min_issuance_date=na_if(min_issuance_date, Inf)) %>%
+  mutate(estimated_date=coalesce(min_issuance_date, `EFFECTIVE DATE`)) %>%
+  mutate(estimated_year=year(estimated_date))
+```
+
+```{r}
+# Lets keep only facilities with data present in both tables
+violations <- violations %>% filter(FACILITY_ID %in% enforcements$FACILITY_ID)
+enforcements <- enforcements %>% filter(FACILITY_ID %in% violations$FACILITY_ID)
+```
+
+```{r}
+violations %>% 
+  filter(FACILITY_ID %in% c('248519', '247750', '215106', '220548'),
+         !((FACILITY_ID == '215106') & (`OCCURRED ON` < (as.Date('2006-01-01'))))) %>%
+  mutate(FACILITY_ID = ifelse(FACILITY_ID=='248519', 'Pismo Beach',
+                          ifelse(FACILITY_ID=='247750', 'Paso Robles',
+                                 ifelse(FACILITY_ID=='215106', 'Colfax', 'Donner Summit')))) %>%
+  mutate(violation_year=year(`OCCURRED ON`)) %>%
+  group_by(FACILITY_ID, violation_year) %>%
+  summarize(n_violations=n_distinct(`VIOLATION ID (VID)`)) %>%
+  full_join(tibble(violation_year=seq(2000,2020)), by='violation_year') %>%
+  replace_na(list(n_violations=0)) %>%
+  ggplot()+
+  geom_line(aes(x=ymd(paste(as.character(violation_year), '01', '01', sep='-')), y=n_violations))+
+  geom_vline(data=enforcements %>% filter(FACILITY_ID %in% c('248519', '247750', '215106', '220548'),
+                                          !((FACILITY_ID == '215106') & (estimated_date < (as.Date('2006-01-01'))))) %>%
+               mutate(FACILITY_ID = ifelse(FACILITY_ID=='248519', 'Pismo Beach',
+                          ifelse(FACILITY_ID=='247750', 'Paso Robles',
+                                 ifelse(FACILITY_ID=='215106', 'Colfax', 'Donner Summit')))),
+             aes(xintercept=estimated_date, alpha=`TOTAL ASSESSMENT AMOUNT`), color='red', linetype='dashed')+
+  facet_wrap(vars(FACILITY_ID), nrow=1, scales='free_x')+
+  theme_minimal()+
+  theme(legend.position='None', panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(), axis.text.x=element_text(size=5),
+        axis.title.y=element_text(size=7), axis.text.y=element_text(size=5))+
+  labs(x='', y='Number of violations')
+
+ggsave('fig_case_study_time_series.png', dpi=preset_dpi, bg='white',
+       width=2800, height=1000, units='px')
+```
+

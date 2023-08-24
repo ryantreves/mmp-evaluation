@@ -1,0 +1,242 @@
+---
+title: "Cumulative Penalties"
+author: "Ryan Treves"
+date: "2023-04-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=F, warning=F)
+library(tidyverse)
+library(yaml)
+library(lubridate)
+library(readxl)
+```
+
+```{r, message=F, warning=F}
+# Retrieve data
+CIWQS_data_path = read_yaml('config.yml', eval.expr=TRUE)$CIWQS_data_path
+
+# Enforcement data
+enforcements <- read_csv(paste0(CIWQS_data_path, '/enf_actions_export.csv'),
+                         col_types = cols(`FACILITY ID` = col_character(), 
+        `ENFORCEMENT ID (EID)` = col_character()))
+
+# Violation data
+violations <- read_excel(paste0(CIWQS_data_path, '/violations_export_2021-10-26.xlsx')) %>%
+  mutate(FACILITY_ID=as.character(FACILITY_ID),
+         `VIOLATION ID (VID)`=as.character(`VIOLATION ID (VID)`)) %>%
+  # We only want non-exempt or dismissed NPDES effluent violations
+  filter(`VIOLATION TYPE`=='Effluent',
+         `STATUS...79` != 'Dismissed',
+         (`EXEMPT (Y/N)` != 'Y' | is.na(`EXEMPT (Y/N)`)),
+         `PLACE SUBTYPE`=='Wastewater Treatment Facility',
+         `PROGRAM...38` %in% c('NPDESWW', 'NPDINDLRG',
+                  'NPDINDSML', 'NPDMINING', 'NPDMUNILRG', 'NPDMUNIOTH',
+                  'NPDNONMUNIPRCS'),
+         (!str_detect(`VIOLATION COMMENTS`, 'In compliance') | 
+            is.na(`VIOLATION COMMENTS`)),
+         (!str_detect(`CORRECTIVE ACTION`, 'In compliance') | 
+            is.na(`CORRECTIVE ACTION`))) %>%
+  # Select only useful columns
+  select(`VIOLATED FACILITY REGION`, FACILITY_ID, `FACILITY NAME`, `PLACE SUBTYPE`,
+         `FACILITY TYPE`, `DESIGN FLOW`, `NPDES# CA#`, `VIOLATION ID (VID)`,
+         `VIOLATION DESCRIPTION`, `VIOLATION COMMENTS`, `CORRECTIVE ACTION`,
+         `OCCURRED ON`)
+```
+
+```{r, warning=F, message=F}
+# Data cleaning
+enforcements <- enforcements %>%
+  # We want MMP-related enforcement actions on POTWs with penalties
+  filter(`TOTAL MMP VIOLATIONS #`>0,
+         (`LIABILITY $ AMOUNT`>0 | `TOTAL ASSESSMENT AMOUNT`>0),
+         `PLACE SUBTYPE`=='Wastewater Treatment Facility',
+         `STATUS...82` != 'Draft') %>%
+  select(`REGION...1`, `FACILITY ID`, `FACILITY NAME`,
+         `ENFORCEMENT ID (EID)`, `ORDER / RESOLUTION NUMBER`,
+         `ENFORCEMENT ACTION TYPE`, `EFFECTIVE DATE...76`, `ADOPTION / ISSUANCE DATE`,
+         `ACL ISSUANCE DATE`, `EPL ISSUANCE DATE`, `STATUS...82`, `DESCRIPTION`,
+         `TOTAL ASSESSMENT AMOUNT`, `INITIAL ASSESSED AMOUNT`, `LIABILITY $ AMOUNT`,
+         `LIABILITY $ PAID`, `TOTAL $ PAID/COMPLETED AMOUNT`) %>%
+  rename(`EFFECTIVE DATE`=`EFFECTIVE DATE...76`,
+         `REGION`=`REGION...1`,
+         `STATUS`=`STATUS...82`) %>%
+  mutate(`EFFECTIVE DATE`=mdy(`EFFECTIVE DATE`),
+         `ADOPTION / ISSUANCE DATE`=mdy(`ADOPTION / ISSUANCE DATE`),
+         `ACL ISSUANCE DATE`=mdy(`ACL ISSUANCE DATE`),
+         `EPL ISSUANCE DATE`=mdy(`EPL ISSUANCE DATE`)) %>% 
+  # Estimate the date of an enforcement action
+  rowwise() %>%
+  mutate(min_issuance_date=min(`ACL ISSUANCE DATE`, `EPL ISSUANCE DATE`, na.rm=T)) %>%
+  mutate(min_issuance_date=na_if(min_issuance_date, Inf)) %>%
+  mutate(estimated_date=coalesce(min_issuance_date, `EFFECTIVE DATE`)) %>%
+  mutate(estimated_year=year(estimated_date))
+         
+
+# Calculate cumulative MMP assessment amounts
+cumulative_enforcements <- enforcements %>%
+    full_join(tibble(`FACILITY ID`=rep((enforcements %>% distinct(`FACILITY ID`,
+                                                                 `REGION`))$`FACILITY ID`, 17),
+                     `REGION`=rep((enforcements %>% distinct(`FACILITY ID`,
+                                                                 `REGION`))$`REGION`, 17),
+                   estimated_year=rep(2000:2016, length(unique(enforcements$`FACILITY ID`)))),
+            by=c('FACILITY ID', 'REGION', 'estimated_year')) %>%
+    group_by(`REGION`, `FACILITY ID`, estimated_year) %>%
+    summarize(annual_total_assessed=sum(`TOTAL ASSESSMENT AMOUNT`, na.rm=T),
+              annual_total_liability=sum(`LIABILITY $ AMOUNT`, na.rm=T),
+              annual_total_actions=n_distinct(`ENFORCEMENT ID (EID)`, na.rm=T)) %>%
+    arrange(estimated_year) %>%
+    group_by(`FACILITY ID`) %>%
+    mutate(`Cumulative total assessed`=cumsum(annual_total_assessed),
+           `Cumulative liability`=cumsum(annual_total_liability)) %>%
+  ungroup()
+
+# Creating variables for grouping
+cumulative_enforcements <- cumulative_enforcements %>% 
+  mutate(treatment=ifelse(`REGION` %in% c('2', '3', '4', '5F', '5S'), 'treatment regions',
+                          'other regions'))
+```
+
+Let's look at descriptive stats for the whole population:
+```{r}
+cumulative_enforcements  %>%
+  select(estimated_year, `Cumulative total assessed`, `Cumulative liability`) %>%
+  rename(`Cumulative liability`=`Cumulative liability`,
+         `Cumulative total assessed`=`Cumulative total assessed`) %>%
+  pivot_longer(cols=-estimated_year, names_to='category', values_to='cum_amount') %>%
+  group_by(estimated_year, category) %>%
+  summarize(cum_amount_0.75=quantile(cum_amount, 0.75),
+            cum_amount_median=median(cum_amount),
+            cum_amount_0.25=quantile(cum_amount, 0.25)) %>%
+  filter(estimated_year <= 2016 & estimated_year >= 2000) %>%
+  ggplot()+
+  geom_ribbon(aes(x=estimated_year, ymax=cum_amount_0.75/1000, ymin=cum_amount_0.25/1000,
+                fill=category), alpha=0.2)+
+  geom_line(aes(x=estimated_year, y=cum_amount_median/1000,
+                color=category))+
+  theme_minimal()+
+  labs(title='Cumulative penalty distributions, statewide', x='', y='thousands of $',
+       subtitle = 'Lines represent medians, shaded regions represent 25th-75th percentiles')+
+  theme(legend.title=element_blank(), legend.position = c(0.2, 0.6))
+```
+
+```{r}
+cumulative_enforcements  %>%
+  select(estimated_year, treatment, annual_total_actions,
+         `Cumulative total assessed`)  %>%
+  group_by(estimated_year, treatment) %>%
+  summarize(`Number of penalties`=sum(annual_total_actions),
+            `Median cumulative penalty amount (thousands of $)`=median(`Cumulative total assessed`)/1000) %>%
+  pivot_longer(cols=c('Number of penalties', 'Median cumulative penalty amount (thousands of $)'), 
+               names_to='variable') %>%
+  filter(estimated_year <= 2016 & estimated_year >= 2000) %>%
+  ggplot()+
+  geom_line(aes(x=estimated_year, y=value,
+                color=treatment), linewidth=0.9)+
+  facet_wrap(vars(variable), scales='free_y', dir='v')+
+  theme_minimal()+
+  labs(x='', subtitle='', y='')+
+  theme(legend.title=element_blank(), legend.position = c(0.2, 0.8))+
+  scale_color_brewer(palette=7)
+```
+```{r}
+cumulative_enforcements  %>%
+  select(estimated_year, treatment, annual_total_actions,
+         `Cumulative total assessed`)  %>%
+  group_by(estimated_year, treatment) %>%
+  summarize(`Number of penalties`=sum(annual_total_actions),
+            `Mean cumulative penalty amount (thousands of $)`=mean(`Cumulative total assessed`)/1000) %>%
+  filter(estimated_year <= 2016 & estimated_year >= 2000) %>%
+  ggplot()+
+  geom_line(aes(x=estimated_year, y=`Mean cumulative penalty amount (thousands of $)`,
+                color=treatment), linewidth=0.9)+
+  theme_minimal()+
+  labs(x='')+
+  theme(legend.title=element_blank(), legend.position = c(0.2, 0.8))+
+  scale_color_brewer(palette=7)
+```
+```{r}
+cum_viol_counts <- violations %>% 
+  filter(`PLACE SUBTYPE`=='Wastewater Treatment Facility') %>%
+  mutate(treatment=ifelse(`VIOLATED FACILITY REGION` %in% c('2', '3', '4', '5F', '5S'), 'treatment regions',
+                          'other regions')) %>%
+  mutate(violation_year=year(`OCCURRED ON`)) %>%
+  group_by(treatment, violation_year) %>%
+  summarize(n_violations=n_distinct(`VIOLATION ID (VID)`))
+
+enforcements %>%
+    full_join(tibble(`REGION`=rep((enforcements %>% distinct(`REGION`))$`REGION`, 17),
+                   estimated_year=rep(2000:2016, length(unique(enforcements$`REGION`)))),
+            by=c('REGION', 'estimated_year')) %>%
+    mutate(treatment=ifelse(`REGION` %in% c('2', '3', '4', '5F', '5S'), 'treatment regions',
+                          'other regions')) %>%
+    inner_join(cum_viol_counts, by=c('treatment'='treatment', 'estimated_year'='violation_year')) %>%
+    group_by(treatment, estimated_year, n_violations) %>%
+    summarize(annual_total_assessed=sum(`TOTAL ASSESSMENT AMOUNT`, na.rm=T)/3000) %>%
+    group_by(treatment) %>%
+  arrange(estimated_year) %>%
+  mutate(cum_violations=cumsum(n_violations), cum_assessed=cumsum(annual_total_assessed)) %>%
+  mutate(cum_assessment_rate=cum_assessed/lag(cum_violations, 2)) %>%
+  ungroup() %>% 
+  ggplot()+
+  geom_line(aes(x=estimated_year, y=cum_assessment_rate,
+                color=treatment), linewidth=0.9)+
+  theme_minimal()+
+  labs(x='', subtitle='', y='Cumulative MMP assessment rate')+
+  theme(legend.title=element_blank(), legend.position = c(0.2, 0.8))+
+  scale_color_brewer(palette=7)+
+  xlim(2002, 2016)
+```
+```{r}
+cum_viol_fac_counts <- violations %>% 
+  mutate(treatment=ifelse(`VIOLATED FACILITY REGION` %in% c('2', '3', '4', '5F', '5S'), 'treatment regions',
+                          'other regions')) %>%
+  mutate(violation_year=year(`OCCURRED ON`)) %>%
+  group_by(treatment) %>%
+  arrange(violation_year) %>%
+  mutate(cum_unique_violators=cumsum(!duplicated(FACILITY_ID))) %>%
+  group_by(treatment, violation_year) %>%
+  summarize(cum_unique_violators=last(cum_unique_violators))
+
+to_plot <- enforcements %>%
+    full_join(tibble(`REGION`=rep((enforcements %>% distinct(`REGION`))$`REGION`, 17),
+                   estimated_year=rep(2000:2016, length(unique(enforcements$`REGION`)))),
+            by=c('REGION', 'estimated_year')) %>%
+    mutate(treatment=ifelse(`REGION` %in% c('2', '3', '4', '5F', '5S'), 'treatment regions',
+                          'other regions')) %>%
+    group_by(treatment, estimated_year) %>%
+    summarize(annual_total_assessed=sum(`TOTAL ASSESSMENT AMOUNT`, na.rm=T)/1000) %>%
+    group_by(treatment) %>%
+  arrange(estimated_year) %>%
+  mutate(cum_assessed=cumsum(annual_total_assessed)) %>%
+  inner_join(cum_viol_fac_counts, by=c('treatment'='treatment', 'estimated_year'='violation_year')) %>%
+  mutate(cum_assessment_rate=cum_assessed/lag(cum_unique_violators, 1)) %>%
+  ungroup()
+
+to_plot %>%
+  ggplot()+
+  geom_line(aes(x=estimated_year, y=cum_assessment_rate,
+                color=treatment), linewidth=0.9)+
+  theme_minimal()+
+  labs(x='', subtitle='', y='Cumulative MMP assessment rate')+
+  theme(legend.title=element_blank(), legend.position = c(0.2, 0.8))+
+  scale_color_brewer(palette=7)
+```
+
+```{r}
+cumulative_enforcements  %>%
+  select(estimated_year, REGION, annual_total_actions,
+         `Cumulative total assessed`)  %>%
+  group_by(estimated_year, REGION) %>%
+  summarize(`Number of penalties`=sum(annual_total_actions),
+            `Mean cumulative penalty amount (thousands of $)`=mean(`Cumulative total assessed`)/1000) %>%
+  filter(estimated_year <= 2016 & estimated_year >= 2000) %>%
+  ggplot()+
+  geom_line(aes(x=estimated_year, y=`Mean cumulative penalty amount (thousands of $)`,
+                color=REGION), linewidth=0.9)+
+  theme_minimal()+
+  labs(x='')+
+  theme(legend.title=element_blank())
+```
+
