@@ -1,0 +1,6 @@
+*.png
+*.csv
+*.xlsx
+*.pdf
+.idea/
+config/config.yml
