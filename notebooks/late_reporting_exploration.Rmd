@@ -1,0 +1,123 @@
+---
+title: "Untitled"
+author: "Ryan Treves"
+date: "2023-08-22"
+output: html_document
+---
+
+
+```{r setup, include=FALSE, message=F}
+knitr::opts_chunk$set(echo = TRUE, warning=F, message=F)
+# Setup
+library(tidyverse)
+library(Synth)
+library(yaml)
+library(lubridate)
+library(ggpubr)
+library(tidysynth)
+```
+
+```{r, warning=F}
+# Retrieve data paths
+ICIS_NPDES_data_path = read_yaml('config.yml', eval.expr=TRUE)$ICIS_NPDES_data_path
+# Specify visual parameters for figures
+preset_dpi <-  read_yaml('config.yml', eval.expr=TRUE)$figure_dpi
+```
+
+Load and clean data:
+```{r, message=F}
+# Load in nationwide data pre-2016 on mean exceedance pcts.
+
+# Source: exceedance_data.sql
+exceedance_data <- read_csv(paste(ICIS_NPDES_data_path,
+                                                    'exceedance_data_yearly_1000.csv',
+                                         sep='/'), 
+    col_types = cols(frac_any_exceedance = col_double(),
+                     frac_any_exceedance_20pct = col_double(),
+                     frac_any_exceedance_40pct = col_double(),
+                     avg_exceedance_rate = col_double(),
+                     avg_exceedance_20pct_rate = col_double(),
+                     avg_exceedance_40pct_rate = col_double(),
+                     mean_days_late = col_double())) %>%
+  replace_na(list(facility_type_indicator='All', parameter_category='All')) %>%
+  # Compute monitoring period with June 2008 as 0
+  mutate(monitoring_period=(lubridate::year(year)-2008)) %>%
+  filter(
+      # Remove Georgia due to a sharp increase in the number of permittees reporting
+       # to ICIS-NPDES in 2008
+    permit_state != 'GA',
+    
+      # Remove observations based on DMR data from fewer than 10 POTWs
+    n_permittees >= 10
+  )
+
+# Load in data on late reporting in CA 
+days_late_disagg <- read_csv(paste(ICIS_NPDES_data_path,
+                                                    'days_late_disagg.csv',
+                                         sep='/'), 
+    col_types = cols(any_exceedance = col_double(),
+                     any_exceedance_20pct = col_double(),
+                     any_exceedance_40pct = col_double(),
+                     days_late = col_double())) %>%
+  replace_na(list(parameter_category='All')) %>%
+  # Compute monitoring period with June 2008 as 0
+  mutate(year=lubridate::year(year))
+```
+
+```{r}
+days_late_disagg %>%
+  arrange(desc(days_late)) %>%
+  head(10)
+```
+
+```{r}
+days_late_disagg %>%
+  mutate(time_period=ifelse(monitoring_period>=0, 'Post-2008', 'Pre-2008')) %>%
+  ggplot()+
+  geom_density(aes(x=days_late, color=time_period))+
+  scale_x_continuous(trans='log10')+
+  theme_minimal()
+```
+```{r}
+days_late_disagg %>%
+  distinct(npdes_permit_id, monitoring_period_end_date, .keep_all=T) %>%
+  group_by(npdes_permit_id, year) %>%
+  summarize(mean_days_late=mean(days_late), n_obs=n()) %>%
+  group_by(year) %>%
+  mutate(overall_mean_days_late=mean(mean_days_late, na.rm=T), overall_median_days_late=median(mean_days_late, na.rm=T),
+         SE_days_late=sd(mean_days_late)/n()) %>%
+  filter(n_obs>=4) %>%
+  ggplot()+
+  geom_line(aes(x=year, y=mean_days_late, group=npdes_permit_id), color='lightgray')+
+  geom_line(aes(x=year, y=overall_mean_days_late), color='black')+
+  labs(x='')+
+  theme_minimal()
+```
+
+```{r}
+exceedance_data %>% 
+  filter(permit_state=='CA') %>%
+  ggplot()+
+  geom_line(aes(x=year, y=mean_days_late, color=parameter_category))+
+  labs(x='', title='CA late reporting by parameter category')+
+  theme(legend.title='None')+
+  theme_minimal()
+```
+
+```{r}
+exceedance_data %>% 
+  filter(parameter_category=='All') %>%
+  ggplot()+
+  geom_line(aes(x=year, y=mean_days_late, group=permit_state), color='lightgray')+
+  geom_line(aes(x=year, y=mean_days_late, color='CA'), data=exceedance_data %>% 
+    filter(parameter_category=='All', permit_state=='CA'))+
+  labs(x='', title='Late reporting by state')+
+  theme(legend.title='None')+
+  theme_minimal()
+```
+
+
+
+
+
+
