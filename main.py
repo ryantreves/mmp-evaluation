@@ -81,27 +81,14 @@ def get_epls(enf, issuance_dates_only=True, valid_only=True):
         epl_enf = epl_enf[epl_enf['STATUS.1'].apply(lambda x: x not in list(['Withdrawn', 'Draft']))]
     return epl_enf
 
-
-def clean_enforcements(enf, mmp_only=True):
-    enf_clean = enf
-    # keep only enforcements for NPDES permittees
-    #enf_clean = enf_clean[enf_clean['PROGRAM'].apply(lambda x: x in NPDES_PROGRAMS)]
-    enf_clean = enf_clean[
-        # option 1: both fields contain NPDES programs
-                          ( (enf_clean['PROGRAM'].isin(NPDES_PROGRAMS)) & (enf_clean['PROGRAM.1'].isin(NPDES_PROGRAMS)) ) |
-        # option 2: one is empty and the other contains a NPDES program
-                          ( (pd.isna(enf_clean['PROGRAM'])) & (enf_clean['PROGRAM.1'].isin(NPDES_PROGRAMS)) ) |
-                          ( (enf_clean['PROGRAM'].isin(NPDES_PROGRAMS)) & (pd.isna(enf_clean['PROGRAM.1'])) )
-                          ]
-    # drop enforcements with 'Draft' status
-    enf_clean = enf_clean[enf_clean['STATUS.1'].apply(lambda x: x not in list(['Draft']))]
-    if mmp_only:
-        # keep only enforcement actions tied to MMP violations
-        enf_clean = enf_clean[enf_clean['TOTAL MMP VIOLATIONS #'] > 0]
-    return enf_clean
-
-
 def clean_violations(viol, mmp_only=True, effluent_only=True):
+    """
+    Function to clean a violations table.
+    @param viol: pd.DataFrame of violations
+    @param mmp_only: bool, whether to exclude non-MMP violations (default True)
+    @param effluent_only: bool, whether or not to exclude non-effluent violations (default True)
+    @return: pd.DataFrame of filtered violations
+    """
     viol_clean = viol
     # remove dismissed violations
     viol_clean = viol_clean[viol_clean['STATUS.1'] != 'Dismissed']
@@ -413,9 +400,11 @@ def regression_preprocess_facility(treat_viol, comp_viol, mmp_viol, timescale='q
 
 
 def compare_composition(data_a, data_b, column, top_n=3):
-    # This function takes in a comparison group, treatment group, and a column name,
+    """
+    This function takes in a comparison group, treatment group, and a column name,
     # and returns the top n values of the column in order of the absolute difference
     # in composition of the two groups. Streamlines compositional analysis.
+    """
     A = pd.DataFrame(data_a[column].value_counts(normalize=True)).rename(columns={column: 'Comparison'})
     B = pd.DataFrame(data_b[column].value_counts(normalize=True)).rename(columns={column: 'Treatment'})
     results = pd.concat([A, B], axis=1).fillna(0)
