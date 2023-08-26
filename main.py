@@ -1,17 +1,7 @@
 ###############################################################################
 # Utility functions for policy evaluation of the MMP program.
 #
-# Inputs:
-#   -
-#
-# Outputs:
-#   - 
-#
-# Author(s): Maggie Hilderbran, Ryan Treves
-#
-# TO DO:
-#   - How do we define MMP violations? Currently, we're just filtering out
-#     non-exempt violations, but how might we identify MMP violations?
+# Author(s): Ryan Treves, Maggie Hilderbran
 #
 ###############################################################################
 
@@ -37,6 +27,16 @@ HIGH_ENFORCEMENT_RATE_THRESHOLD = 0.75  # threshold for 'consistent enforcement'
 # -----------------------------------------------------------------------------
 
 def get_epls(enf, issuance_dates_only=True, valid_only=True):
+  """
+  Function to extract enforcement actions listed as Expedited Payment Letters (EPLs)
+  from a list of enforcement actions.
+  @param enf: pd.DataFrame of enforcement actions
+  @param issuance_dates_only: bool, whether or not to exclude enforcement actions
+    without valid issuance dates (default True)
+  @param valid_only: bool, whether to drop enforcement actions with status "Withdrawn" 
+    or "Draft" (default True)
+  @returns pd.DataFrame containing filtered rows of enf
+  """
     if issuance_dates_only:
         # must have ACL and/or EPL issuance date
         epl_enf = enf[
