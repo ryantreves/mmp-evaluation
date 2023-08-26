@@ -1,5 +1,14 @@
+/*
+This script creates and queries a table of NPDES DMRs to be analyzed in our synthetic control design.
+Author: Ryan Treves
+Prerequisites: 
+    - Connection to our Postgres DB configured
+    - Write privileges in the `scratch` schema
+    - `create_param_categories.sql` and `create_treatment_group.sql` run prior 
+*/
 
--- Put together a list of permits to include
+
+-- Put together a list of NPDES permits to include
 DROP TABLE IF EXISTS tmp_synth_permits CASCADE;
 CREATE LOCAL TEMPORARY TABLE tmp_synth_permits
     ON COMMIT PRESERVE ROWS
