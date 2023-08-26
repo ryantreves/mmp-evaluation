@@ -1,6 +1,12 @@
+/*
+This script creates a table of parameter <-> parameter category links based on hand-coded parameters, as well as 
+other parameters with the same pollutant codes as our hand-coded parameters.
+Author: Ryan Treves
+Prerequisites: 
+    - Connection to our Postgres DB configured
+    - Write privileges in the `scratch` schema
+*/
 
--- Create table of parameter <-> parameter category links based on hand-coded parameters, as well as 
--- other parameters with the same pollutant codes as our hand-coded parameters.
 DROP TABLE IF exists scratch.param_categories cascade;
 CREATE TABLE  scratch.param_categories
     AS
