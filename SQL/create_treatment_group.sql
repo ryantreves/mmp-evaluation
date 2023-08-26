@@ -1,3 +1,12 @@
+/*
+This script creates a table of NPDES permittees to be included in our treatment group, based on our analysis requirements.
+Author: Ryan Treves
+Prerequisites: 
+    - Connection to our Postgres DB configured
+    - Write privileges in the `scratch` schema
+    - CA water board regional boundaries already ingested into kit_sandbox.ca_waterboard_regions 
+*/
+
 
 -- NPDES Permit IDs for regions 2,3,4,5 from Ryan's script (ideally should be able to just use geocodes above, but this does capture ~30 that are missed by the geo join)
 -- HOWEVER, this also misses a ton, for instance half of the POTWs permits in these regions aren't included in this extract (some may be historical permits, but several are definitely current)
